@@ -4,24 +4,25 @@
 # Copyright (c) 2018-2021 Markus Blöchl
 # Released under the MIT License
 
-import sys
+import argparse
+import base64
+import json
 import os
 import socket
-import json
-import base64
 import subprocess
-import argparse
+import sys
 
-import nacl.utils
 import nacl.public
+import nacl.utils
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Full passwords from KeepassXC")
+    parser = argparse.ArgumentParser(description="Fill passwords from KeepassXC")
     parser.add_argument('url', nargs='?', default=os.environ.get('QUTE_URL'))
     parser.add_argument('--totp', action='store_true',
                         help="Fill in current TOTP field instead of username/password")
-    parser.add_argument('--socket', '-s', default='/run/user/{}/org.keepassxc.KeePassXC.BrowserServer'.format(os.getuid()),
+    parser.add_argument('--socket', '-s',
+                        default='/run/user/{}/org.keepassxc.KeePassXC.BrowserServer'.format(os.getuid()),
                         help='Path to KeepassXC browser socket')
     parser.add_argument('--key', '-k', default='alice@example.com',
                         help='GPG key to encrypt KeepassXC auth key with')
@@ -41,13 +42,14 @@ class KeepassError(Exception):
 
 class KeepassXC:
     """ Wrapper around the KeepassXC socket API """
+
     def __init__(self, id=None, *, key, socket_path):
-        self.sock        = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.id          = id
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.id = id
         self.socket_path = socket_path
-        self.client_key  = nacl.public.PrivateKey.generate()
-        self.id_key      = nacl.public.PrivateKey.from_seed(key)
-        self.cryptobox   = None
+        self.client_key = nacl.public.PrivateKey.generate()
+        self.id_key = nacl.public.PrivateKey.from_seed(key)
+        self.cryptobox: nacl.public.Box = None
 
     def connect(self):
         if not os.path.exists(self.socket_path):
@@ -56,20 +58,17 @@ class KeepassXC:
         self.sock.connect(self.socket_path)
 
         self.send_raw_msg(dict(
-            action    = 'change-public-keys',
-            publicKey = base64.b64encode(self.client_key.public_key.encode()).decode('utf-8'),
-            nonce     = base64.b64encode(nacl.utils.random(nacl.public.Box.NONCE_SIZE)).decode('utf-8'),
-            clientID  = self.client_id
+            action='change-public-keys',
+            publicKey=base64.b64encode(self.client_key.public_key.encode()).decode('utf-8'),
+            nonce=base64.b64encode(nacl.utils.random(nacl.public.Box.NONCE_SIZE)).decode('utf-8'),
+            clientID=self.client_id
         ))
 
         resp = self.recv_raw_msg()
         assert resp['action'] == 'change-public-keys'
         assert resp['success'] == 'true'
         assert resp['nonce']
-        self.cryptobox = nacl.public.Box(
-            self.client_key,
-            nacl.public.PublicKey(base64.b64decode(resp['publicKey']))
-        )
+        self.cryptobox = nacl.public.Box(self.client_key, nacl.public.PublicKey(base64.b64decode(resp['publicKey'])))
 
     def get_databasehash(self):
         self.send_msg(dict(action='get-databasehash'))
@@ -85,57 +84,54 @@ class KeepassXC:
             raise
         return False
 
-
     def test_associate(self):
         if not self.id:
             return False
         self.send_msg(dict(
-            action = 'test-associate',
-            id     = self.id,
-            key    = base64.b64encode(self.id_key.public_key.encode()).decode('utf-8')
-        ), triggerUnlock = 'true')
+            action='test-associate',
+            id=self.id,
+            key=base64.b64encode(self.id_key.public_key.encode()).decode('utf-8')
+        ), triggerUnlock='true')
         return self.recv_msg()['success'] == 'true'
 
     def associate(self):
         self.send_msg(dict(
-            action = 'associate',
-            key    = base64.b64encode(self.client_key.public_key.encode()).decode('utf-8'),
-            idKey  = base64.b64encode(self.id_key.public_key.encode()).decode('utf-8')
+            action='associate',
+            key=base64.b64encode(self.client_key.public_key.encode()).decode('utf-8'),
+            idKey=base64.b64encode(self.id_key.public_key.encode()).decode('utf-8')
         ))
         resp = self.recv_msg()
         self.id = resp['id']
 
     def get_logins(self, url):
         self.send_msg(dict(
-            action = 'get-logins',
-            url    = url,
-            keys   = [{ 'id': self.id, 'key': base64.b64encode(self.id_key.public_key.encode()).decode('utf-8') }]
+            action='get-logins',
+            url=url,
+            keys=[{'id': self.id, 'key': base64.b64encode(self.id_key.public_key.encode()).decode('utf-8')}]
         ))
         return self.recv_msg()['entries']
 
     def get_totp(self, uuid):
-        self.send_msg(dict(
-            action = 'get-totp',
-            uuid = uuid
-        ))
+        self.send_msg(dict(action='get-totp', uuid=uuid))
         response = self.recv_msg()
         if response['success'] != 'true' or not response['totp']:
             return None
         return response['totp']
 
     def send_raw_msg(self, msg):
-        self.sock.send( json.dumps(msg).encode('utf-8') )
+        self.sock.send(json.dumps(msg).encode('utf-8'))
 
     def recv_raw_msg(self):
-        return json.loads( self.sock.recv(4096).decode('utf-8') )
+        return json.loads(self.sock.recv(4096).decode('utf-8'))
 
     def send_msg(self, msg, **extra):
         nonce = nacl.utils.random(nacl.public.Box.NONCE_SIZE)
+        encmsg = self.cryptobox.encrypt(json.dumps(msg).encode('utf-8'), nonce).ciphertext
         self.send_raw_msg(dict(
-            action   = msg['action'],
-            message  = base64.b64encode(self.cryptobox.encrypt(json.dumps(msg).encode('utf-8'), nonce).ciphertext).decode('utf-8'),
-            nonce    = base64.b64encode(nonce).decode('utf-8'),
-            clientID = self.client_id,
+            action=msg['action'],
+            message=base64.b64encode(encmsg).decode('utf-8'),
+            nonce=base64.b64encode(nonce).decode('utf-8'),
+            clientID=self.client_id,
             **extra
         ))
 
@@ -144,8 +140,8 @@ class KeepassXC:
         if 'error' in resp:
             raise KeepassError(resp['errorCode'], resp['error'])
         assert resp['action']
-        return json.loads(self.cryptobox.decrypt(base64.b64decode(resp['message']), base64.b64decode(resp['nonce'])).decode('utf-8'))
-
+        msg = self.cryptobox.decrypt(base64.b64decode(resp['message']), base64.b64decode(resp['nonce'])).decode('utf-8')
+        return json.loads(msg)
 
 
 class SecretKeyStore:
@@ -171,14 +167,15 @@ class SecretKeyStore:
         self.key = nacl.utils.random(32)
         self.id = None
 
-    def store(self, id):
+    def store(self, id_):
         "Store newly created association key in file"
-        self.id = id
-        jsondata = json.dumps({'id':self.id, 'key':base64.b64encode(self.key).decode('utf-8')})
+        self.id = id_
+        jsondata = json.dumps({'id': self.id, 'key': base64.b64encode(self.key).decode('utf-8')})
         if self.gpgkey is None:
             open(self.path, "w").write(jsondata)
         else:
-            subprocess.run(['gpg', '--encrypt', '-o', self.path, '-r', self.gpgkey], input=jsondata.encode('utf-8'), check=True)
+            subprocess.run(['gpg', '--encrypt', '-o', self.path, '-r', self.gpgkey], input=jsondata.encode('utf-8'),
+                           check=True)
 
 
 def qute(cmd):
@@ -186,6 +183,7 @@ def qute(cmd):
         fifo.write(cmd)
         fifo.write('\n')
         fifo.flush()
+
 
 def error(msg):
     print(msg, file=sys.stderr)
@@ -348,4 +346,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
